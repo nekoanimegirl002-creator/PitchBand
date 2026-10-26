@@ -1,173 +1,198 @@
+#include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-namespace
+PitchBendProcessor::PitchBendProcessor()
+    : AudioProcessor (BusesProperties()
+                          .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "STATE", createLayout())
 {
-    const juce::Colour bgColour     (0xfffff5f8); // very light pink
-    const juce::Colour panelColour  (0xffffe8ef);
-    const juce::Colour trackColour  (0xfff7d9e4);
-    const juce::Colour accentColour (0xfff3a9c3); // soft pink
-    const juce::Colour deepColour   (0xffe58aab); // slightly deeper pink for thumbs
-    const juce::Colour textColour   (0xff6e4b5c); // dusty mauve, readable but gentle
-    const juce::Colour buttonColour (0xffffd9e5);
 }
 
-PinkLookAndFeel::PinkLookAndFeel()
+juce::AudioProcessorValueTreeState::ParameterLayout PitchBendProcessor::createLayout()
 {
-    setColour (juce::ResizableWindow::backgroundColourId, bgColour);
+    using namespace juce;
+    AudioProcessorValueTreeState::ParameterLayout layout;
 
-    setColour (juce::Slider::backgroundColourId,          trackColour);
-    setColour (juce::Slider::trackColourId,               accentColour);
-    setColour (juce::Slider::thumbColourId,               deepColour);
-    setColour (juce::Slider::rotarySliderFillColourId,    accentColour);
-    setColour (juce::Slider::rotarySliderOutlineColourId, trackColour);
-    setColour (juce::Slider::textBoxTextColourId,         textColour);
-    setColour (juce::Slider::textBoxBackgroundColourId,   juce::Colours::transparentWhite);
-    setColour (juce::Slider::textBoxOutlineColourId,      juce::Colours::transparentWhite);
-    setColour (juce::Slider::textBoxHighlightColourId,    accentColour.withAlpha (0.4f));
+    // Bend wheel: -1 .. +1, like a synth pitch wheel. Centre = no change.
+    layout.add (std::make_unique<AudioParameterFloat> (
+        ParameterID { "bend", 1 }, "Bend",
+        NormalisableRange<float> (-1.0f, 1.0f, 0.0005f), 0.0f));
 
-    setColour (juce::Label::textColourId,                 textColour);
-    setColour (juce::CaretComponent::caretColourId,       deepColour);
+    // Bend range in semitones (what the wheel reaches at its extremes): 1 .. 24
+    layout.add (std::make_unique<AudioParameterInt> (
+        ParameterID { "range", 1 }, "Range", 1, 24, 12));
 
-    setColour (juce::TextButton::buttonColourId,          buttonColour);
-    setColour (juce::TextButton::buttonOnColourId,        accentColour);
-    setColour (juce::TextButton::textColourOffId,         textColour);
-    setColour (juce::TextButton::textColourOnId,          textColour);
+    // Glide time in ms (smooths jumps / automation steps)
+    layout.add (std::make_unique<AudioParameterFloat> (
+        ParameterID { "smooth", 1 }, "Smooth",
+        NormalisableRange<float> (0.0f, 2000.0f, 0.1f, 0.4f), 30.0f));
+
+    // Dry/wet
+    layout.add (std::make_unique<AudioParameterFloat> (
+        ParameterID { "mix", 1 }, "Mix",
+        NormalisableRange<float> (0.0f, 1.0f, 0.001f), 1.0f));
+
+    // Power (on/off)
+    layout.add (std::make_unique<AudioParameterBool> (
+        ParameterID { "power", 1 }, "Power", true));
+
+    return layout;
 }
 
-PitchBendEditor::PitchBendEditor (PitchBendProcessor& p)
-    : juce::AudioProcessorEditor (&p),
-      proc (p),
-      bendAtt   (p.apvts, "bend",   bendSlider),
-      rangeAtt  (p.apvts, "range",  rangeSlider),
-      smoothAtt (p.apvts, "smooth", smoothSlider),
-      mixAtt    (p.apvts, "mix",    mixSlider),
-      powerAtt  (*p.apvts.getParameter ("power"),
-                 [this] (float v)
-                 {
-                     const bool on = v > 0.5f;
-                     powerButton.setToggleState (on, juce::dontSendNotification);
-                     powerButton.setButtonText (on ? "ON" : "OFF");
-                 })
+void PitchBendProcessor::resetToDefaults()
 {
-    setLookAndFeel (&laf);
-
-    auto setupLabel = [this] (juce::Label& l, const juce::String& text)
+    for (auto* p : getParameters())
     {
-        l.setText (text, juce::dontSendNotification);
-        l.setJustificationType (juce::Justification::centred);
-        addAndMakeVisible (l);
-    };
-
-    setupLabel (bendLabel,   "Bend");
-    setupLabel (rangeLabel,  "Range (+/- semitones)");
-    setupLabel (smoothLabel, "Smooth");
-    setupLabel (mixLabel,    "Mix");
-
-    for (auto* s : { &bendSlider, &rangeSlider, &smoothSlider, &mixSlider })
-        addAndMakeVisible (s);
-
-    bendSlider.setTextBoxStyle   (juce::Slider::TextBoxAbove, false, 120, 24);
-    rangeSlider.setTextBoxStyle  (juce::Slider::TextBoxBelow, false, 70, 20);
-    smoothSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 20);
-    mixSlider.setTextBoxStyle    (juce::Slider::TextBoxBelow, false, 70, 20);
-
-    // Bend shows the real pitch shift in semitones (wheel position x range)
-    auto currentRange = [this] { return (double) *proc.apvts.getRawParameterValue ("range"); };
-
-    bendSlider.textFromValueFunction = [currentRange] (double v)
-    {
-        const double st = v * currentRange();
-        return juce::String (st > 0.005 ? "+" : "") + juce::String (st, 2) + " st";
-    };
-    bendSlider.valueFromTextFunction = [currentRange] (const juce::String& t)
-    {
-        return juce::jlimit (-1.0, 1.0, t.getDoubleValue() / juce::jmax (1.0, currentRange()));
-    };
-
-    rangeSlider.textFromValueFunction = [] (double v) { return juce::String (juce::roundToInt (v)) + " st"; };
-    rangeSlider.valueFromTextFunction = [] (const juce::String& t) { return juce::jlimit (1.0, 24.0, t.getDoubleValue()); };
-
-    smoothSlider.textFromValueFunction = [] (double v) { return juce::String (juce::roundToInt (v)) + " ms"; };
-    smoothSlider.valueFromTextFunction = [] (const juce::String& t) { return t.getDoubleValue(); };
-
-    mixSlider.textFromValueFunction = [] (double v) { return juce::String (juce::roundToInt (v * 100.0)) + " %"; };
-    mixSlider.valueFromTextFunction = [] (const juce::String& t) { return t.getDoubleValue() / 100.0; };
-
-    // When the range changes, the displayed semitone value of the wheel changes too
-    rangeSlider.onValueChange = [this] { bendSlider.updateText(); };
-
-    for (auto* s : { &bendSlider, &rangeSlider, &smoothSlider, &mixSlider })
-        s->updateText();
-
-    // Power (on/off) and Reset buttons
-    addAndMakeVisible (powerButton);
-    addAndMakeVisible (resetButton);
-
-    powerButton.setClickingTogglesState (true);
-    powerButton.onClick = [this]
-    {
-        powerAtt.setValueAsCompleteGesture (powerButton.getToggleState() ? 1.0f : 0.0f);
-    };
-    powerAtt.sendInitialUpdate();
-
-    resetButton.onClick = [this] { proc.resetToDefaults(); };
-
-    setSize (460, 320);
+        if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (p))
+        {
+            rp->beginChangeGesture();
+            rp->setValueNotifyingHost (rp->getDefaultValue());
+            rp->endChangeGesture();
+        }
+    }
 }
 
-PitchBendEditor::~PitchBendEditor()
+bool PitchBendProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    setLookAndFeel (nullptr);
+    const auto out = layouts.getMainOutputChannelSet();
+    if (out != juce::AudioChannelSet::mono() && out != juce::AudioChannelSet::stereo())
+        return false;
+    return out == layouts.getMainInputChannelSet();
 }
 
-void PitchBendEditor::paint (juce::Graphics& g)
+void PitchBendProcessor::prepareToPlay (double sampleRate, int)
 {
-    g.fillAll (bgColour);
+    sr = sampleRate;
 
-    auto panel = getLocalBounds().toFloat().reduced (8.0f);
-    g.setColour (panelColour);
-    g.fillRoundedRectangle (panel, 16.0f);
-    g.setColour (accentColour.withAlpha (0.6f));
-    g.drawRoundedRectangle (panel, 16.0f, 1.5f);
+    // ~50 ms grain window; keep it even
+    int w = (int) std::lround (0.050 * sampleRate);
+    w += (w & 1);
+    windowSize = (float) w;
 
-    // Title with two small sparkles
-    g.setColour (textColour);
-    g.setFont (juce::FontOptions (17.0f, juce::Font::bold));
-    g.drawText ("PITCH BEND", juce::Rectangle<int> (80, 20, getWidth() - 160, 30),
-                juce::Justification::centred);
+    const int size = juce::nextPowerOfTwo (w + 16);
+    mask = size - 1;
+    delayBuf.setSize (2, size);
+    delayBuf.clear();
+    writePos = 0;
+    phase = 0.0f;
 
-    auto sparkle = [&g] (juce::Point<float> c, float size)
-    {
-        juce::Path star;
-        star.addStar (c, 4, size * 0.28f, size, 0.0f);
-        g.setColour (accentColour);
-        g.fillPath (star);
-    };
-    const float cx = (float) getWidth() * 0.5f;
-    sparkle ({ cx - 78.0f, 35.0f }, 7.0f);
-    sparkle ({ cx + 78.0f, 35.0f }, 5.0f);
+    smoothedSemis = *apvts.getRawParameterValue ("bend")
+                  * *apvts.getRawParameterValue ("range");
+
+    smoothedMix.reset (sampleRate, 0.02);
+    smoothedMix.setCurrentAndTargetValue (*apvts.getRawParameterValue ("mix"));
+
+    smoothedPower.reset (sampleRate, 0.02);
+    smoothedPower.setCurrentAndTargetValue (*apvts.getRawParameterValue ("power") > 0.5f ? 1.0f : 0.0f);
+
+    // Dry path is delayed by half a window so wet and dry stay aligned
+    setLatencySamples (w / 2 + 2);
 }
 
-void PitchBendEditor::resized()
+// 4-point Hermite interpolation. 'delay' is in samples (>= 0, fractional).
+float PitchBendProcessor::readHermite (int ch, float delay) const noexcept
 {
-    auto area = getLocalBounds().reduced (20);
+    const float rp = (float) writePos - delay - 2.0f;
+    const int   i0 = (int) std::floor (rp);
+    const float f  = rp - (float) i0;
 
-    auto top = area.removeFromTop (30);
-    powerButton.setBounds (top.removeFromLeft (60));
-    resetButton.setBounds (top.removeFromRight (70));
+    const float* d = delayBuf.getReadPointer (ch);
+    const float y0 = d[(i0 - 1) & mask];
+    const float y1 = d[ i0      & mask];
+    const float y2 = d[(i0 + 1) & mask];
+    const float y3 = d[(i0 + 2) & mask];
 
-    area.removeFromTop (14);
-    bendLabel.setBounds  (area.removeFromTop (18));
-    bendSlider.setBounds (area.removeFromTop (70));
-    area.removeFromTop (12);
+    const float c1 = 0.5f * (y2 - y0);
+    const float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+    const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
+    return ((c3 * f + c2) * f + c1) * f + y1;
+}
 
-    const int col = area.getWidth() / 3;
-    auto place = [] (juce::Label& l, juce::Slider& s, juce::Rectangle<int> r)
+void PitchBendProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    const int numCh = juce::jmin (buffer.getNumChannels(), 2);
+    const int n     = buffer.getNumSamples();
+
+    // Wheel position (-1..1) x range (1..24 semitones) = target pitch shift
+    const float bend  = *apvts.getRawParameterValue ("bend");
+    const float range = *apvts.getRawParameterValue ("range");
+    const float targetSemis = bend * range;
+
+    const float smoothMs = *apvts.getRawParameterValue ("smooth");
+    smoothedMix.setTargetValue (*apvts.getRawParameterValue ("mix"));
+    smoothedPower.setTargetValue (*apvts.getRawParameterValue ("power") > 0.5f ? 1.0f : 0.0f);
+
+    // One-pole smoothing coefficient for the pitch value
+    const float coeff = smoothMs < 0.01f
+                          ? 0.0f
+                          : std::exp (-1.0f / (0.001f * smoothMs * (float) sr));
+
+    const float W = windowSize;
+    const int dryDelay = (int) (W * 0.5f) + 2;
+    constexpr float pi = juce::MathConstants<float>::pi;
+
+    for (int i = 0; i < n; ++i)
     {
-        l.setBounds (r.removeFromTop (18));
-        s.setBounds (r);
-    };
-    place (rangeLabel,  rangeSlider,  area.removeFromLeft (col));
-    place (smoothLabel, smoothSlider, area.removeFromLeft (col));
-    place (mixLabel,    mixSlider,    area);
+        smoothedSemis = targetSemis + (smoothedSemis - targetSemis) * coeff;
+        const float mix   = smoothedMix.getNextValue();
+        const float power = smoothedPower.getNextValue();
+        const float ratio = std::exp2 (smoothedSemis / 12.0f);
+
+        // Write the input into the delay line
+        for (int ch = 0; ch < numCh; ++ch)
+            delayBuf.setSample (ch, writePos, buffer.getSample (ch, i));
+
+        // Two taps, half a window apart, crossfaded with sin^2 / cos^2
+        const float phaseB = (phase + 0.5f >= 1.0f) ? phase - 0.5f : phase + 0.5f;
+        const float dA = phase  * W;
+        const float dB = phaseB * W;
+        const float s  = std::sin (pi * phase);
+        const float wA = s * s;
+        const float wB = 1.0f - wA;
+
+        // Near 0 semitones, fade to the (aligned) dry signal so the two taps
+        // do not produce a comb filter on a static setting
+        const float wetAmount = juce::jmin (1.0f, std::abs (smoothedSemis) / 0.1f);
+        const float wetMix = mix * wetAmount * power;
+
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            const float wet = wA * readHermite (ch, dA) + wB * readHermite (ch, dB);
+            const float dry = delayBuf.getSample (ch, (writePos - dryDelay) & mask);
+            buffer.setSample (ch, i, dry * (1.0f - wetMix) + wet * wetMix);
+        }
+
+        // Read pointer moves at 'ratio' speed relative to the write pointer
+        phase += (1.0f - ratio) / W;
+        while (phase < 0.0f)  phase += 1.0f;
+        while (phase >= 1.0f) phase -= 1.0f;
+
+        writePos = (writePos + 1) & mask;
+    }
+}
+
+juce::AudioProcessorEditor* PitchBendProcessor::createEditor()
+{
+    return new PitchBendEditor (*this);
+}
+
+void PitchBendProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    if (auto xml = apvts.copyState().createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void PitchBendProcessor::setStateInformation (const void* data, int size)
+{
+    if (auto xml = getXmlFromBinary (data, size))
+        if (xml->hasTagName (apvts.state.getType()))
+            apvts.replaceState (juce::ValueTree::fromXml (*xml));
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new PitchBendProcessor();
 }
