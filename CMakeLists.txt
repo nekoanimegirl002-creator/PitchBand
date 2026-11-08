@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(PitchBend VERSION 0.1.0)
+project(PitchBend VERSION 0.1.2)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -12,11 +12,13 @@ FetchContent_MakeAvailable(JUCE)
 option(COPY_AFTER_BUILD "Copy the plugin to the system VST3 folder after build" ON)
 
 juce_add_plugin(PitchBend
-    COMPANY_NAME "MyStudio"
-    PLUGIN_MANUFACTURER_CODE Mstd
-    PLUGIN_CODE Pbnd
+    VERSION 0.1.2
+    COMPANY_NAME "N3KO"
+    BUNDLE_ID com.n3ko.pitchband
+    PLUGIN_MANUFACTURER_CODE N3KO
+    PLUGIN_CODE PbBd
     FORMATS VST3 Standalone
-    PRODUCT_NAME "Pitch Bend"
+    PRODUCT_NAME "Pitch Band"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE
     NEEDS_MIDI_OUTPUT FALSE
