@@ -37,6 +37,19 @@ juce::AudioProcessorValueTreeState::ParameterLayout PitchBendProcessor::createLa
     layout.add (std::make_unique<AudioParameterBool> (
         ParameterID { "power", 1 }, "Power", true));
 
+    // Mode: Default (pitch and timbre move together) or Complex (formant control)
+    layout.add (std::make_unique<AudioParameterChoice> (
+        ParameterID { "mode", 1 }, "Mode", StringArray { "Default", "Complex" }, 0));
+
+    // Formant shift in semitones (Complex mode)
+    layout.add (std::make_unique<AudioParameterFloat> (
+        ParameterID { "formant", 1 }, "Formant",
+        NormalisableRange<float> (-12.0f, 12.0f, 0.01f), 0.0f));
+
+    // Snap: the bend moves in whole semitones only
+    layout.add (std::make_unique<AudioParameterBool> (
+        ParameterID { "snap", 1 }, "Snap", false));
+
     return layout;
 }
 
@@ -65,27 +78,29 @@ void PitchBendProcessor::prepareToPlay (double sampleRate, int)
 {
     sr = sampleRate;
 
-    // Grain window ~50 ms (even), matching segment ~16 ms, search range ~12 ms
-    int w = (int) std::lround (0.050 * sampleRate);
-    w += (w & 1);
-    Wf = (float) w;
-    corrLen     = ((int) std::lround (0.016 * sampleRate)) & ~3; // multiple of 4
-    searchRange = (int) std::lround (0.012 * sampleRate);
+    // FFT size of the Complex engine; it also sets the common latency of both engines
+    const int fftSize = sampleRate <= 50000.0 ? 2048 : (sampleRate <= 100000.0 ? 4096 : 8192);
 
-    dMin = (float) (corrLen + 4);
-    dMax = dMin + Wf;
+    grain.setTuning (60.0, 15.0, 16.0);
+    const int latency = grain.prepare (sampleRate, fftSize);
+    for (auto& v : pv)
+        v.prepare (sampleRate, fftSize, 8);
 
-    const int size = juce::nextPowerOfTwo ((int) dMax + 64);
-    mask = size - 1;
-    delayBuf.setSize (2, size);
-    delayBuf.clear();
-    monoBuf.assign ((size_t) size, 0.0f);
-    refSeg.assign ((size_t) (corrLen / 4 + 1), 0.0f);
-    writePos = 0;
+    // The Complex engine delays by fftSize samples; pad it up to the common latency
+    padDelay = juce::jmax (0, latency - fftSize);
+    const int padSize = juce::nextPowerOfTwo (padDelay + 8);
+    for (auto& b : padBuf)
+        b.assign ((size_t) padSize, 0.0f);
+    padMask = padSize - 1;
+    padPos = 0;
 
-    // Two grains, half a window apart
-    dA = dMin;
-    dB = dMin + 0.5f * Wf;
+    // Dry path delayed by the same latency
+    dryDelay = latency;
+    const int drySize = juce::nextPowerOfTwo (latency + 8);
+    dryBuf.setSize (2, drySize);
+    dryBuf.clear();
+    dryMask = drySize - 1;
+    dryPos = 0;
 
     smoothedSemis = *apvts.getRawParameterValue ("bend")
                   * *apvts.getRawParameterValue ("range");
@@ -96,73 +111,13 @@ void PitchBendProcessor::prepareToPlay (double sampleRate, int)
     smoothedPower.reset (sampleRate, 0.02);
     smoothedPower.setCurrentAndTargetValue (*apvts.getRawParameterValue ("power") > 0.5f ? 1.0f : 0.0f);
 
-    // Dry path is delayed by the average grain delay so wet and dry stay aligned.
-    // The same value is reported to the host so it can compensate the latency.
-    dryDelay = (int) (dMin + 0.5f * Wf) + 2;
-    setLatencySamples (dryDelay);
-}
+    smoothedMode.reset (sampleRate, 0.025);
+    smoothedMode.setCurrentAndTargetValue (*apvts.getRawParameterValue ("mode") > 0.5f ? 1.0f : 0.0f);
 
-// 4-point Hermite interpolation. 'delay' is in samples (>= 0, fractional).
-float PitchBendProcessor::readHermite (int ch, float delay) const noexcept
-{
-    const float rp = (float) writePos - delay - 2.0f;
-    const int   i0 = (int) std::floor (rp);
-    const float f  = rp - (float) i0;
+    smoothedFormant.reset (sampleRate, 0.03);
+    smoothedFormant.setCurrentAndTargetValue (*apvts.getRawParameterValue ("formant"));
 
-    const float* d = delayBuf.getReadPointer (ch);
-    const float y0 = d[(i0 - 1) & mask];
-    const float y1 = d[ i0      & mask];
-    const float y2 = d[(i0 + 1) & mask];
-    const float y3 = d[(i0 + 2) & mask];
-
-    const float c1 = 0.5f * (y2 - y0);
-    const float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
-    const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
-    return ((c3 * f + c2) * f + c1) * f + y1;
-}
-
-// Picks where a grain that ran out of its window should restart.
-// Candidate positions are compared (normalised cross-correlation) with what the other
-// grain is playing, and the best match wins, so both grains are in phase when they crossfade.
-// 'toTop' = true when the grain left through the bottom of the window (pitch up).
-float PitchBendProcessor::chooseReseat (float dOther, bool toTop)
-{
-    const int refD = (int) std::lround (dOther);
-    const int n    = corrLen / 4;
-
-    // How far the other grain has travelled through its window (0..1)
-    const float tauO = toTop ? (dMax - dOther) / Wf : (dOther - dMin) / Wf;
-
-    // Keep the two grains at least a quarter window apart so they never collapse together
-    const float sMax = juce::jmin ((float) searchRange, juce::jmax (0.0f, (tauO - 0.25f) * Wf));
-
-    for (int k = 0; k < n; ++k)
-        refSeg[(size_t) k] = monoBuf[(size_t) ((writePos - refD + 4 * k) & mask)];
-
-    float best = -1.0e30f;
-    int bestS = 0;
-
-    for (int s = 0; s <= (int) sMax; s += 2)
-    {
-        const int dc = toTop ? (int) dMax - s : (int) dMin + s;
-        float dot = 0.0f, en = 1.0e-9f;
-
-        for (int k = 0; k < n; ++k)
-        {
-            const float c = monoBuf[(size_t) ((writePos - dc + 4 * k) & mask)];
-            dot += refSeg[(size_t) k] * c;
-            en  += c * c;
-        }
-
-        const float score = dot / std::sqrt (en);
-        if (score > best)
-        {
-            best = score;
-            bestS = s;
-        }
-    }
-
-    return toTop ? dMax - (float) bestS : dMin + (float) bestS;
+    setLatencySamples (latency);
 }
 
 void PitchBendProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -171,76 +126,81 @@ void PitchBendProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     const int numCh = juce::jmin (buffer.getNumChannels(), 2);
     const int n     = buffer.getNumSamples();
+    if (numCh < 1)
+        return;
 
     // Wheel position (-1..1) x range (1..24 semitones) = target pitch shift
     const float bend  = *apvts.getRawParameterValue ("bend");
     const float range = *apvts.getRawParameterValue ("range");
-    const float targetSemis = bend * range;
+    float targetSemis = bend * range;
+
+    // Snap: only whole semitones
+    if (*apvts.getRawParameterValue ("snap") > 0.5f)
+        targetSemis = std::round (targetSemis);
 
     const float smoothMs = *apvts.getRawParameterValue ("smooth");
     smoothedMix.setTargetValue (*apvts.getRawParameterValue ("mix"));
     smoothedPower.setTargetValue (*apvts.getRawParameterValue ("power") > 0.5f ? 1.0f : 0.0f);
+    smoothedMode.setTargetValue (*apvts.getRawParameterValue ("mode") > 0.5f ? 1.0f : 0.0f);
+    smoothedFormant.setTargetValue (*apvts.getRawParameterValue ("formant"));
 
     // One-pole smoothing coefficient for the pitch value
     const float coeff = smoothMs < 0.01f
                           ? 0.0f
                           : std::exp (-1.0f / (0.001f * smoothMs * (float) sr));
 
-    // Window shape of a grain: 0 at both ends, 1 in the middle
-    auto windowAt = [this] (float d)
-    {
-        const float x = juce::jlimit (0.0f, 1.0f, (d - dMin) / Wf);
-        const float s = std::sin (juce::MathConstants<float>::pi * x);
-        return s * s;
-    };
-
     for (int i = 0; i < n; ++i)
     {
         smoothedSemis = targetSemis + (smoothedSemis - targetSemis) * coeff;
-        const float mix   = smoothedMix.getNextValue();
-        const float power = smoothedPower.getNextValue();
-        const float ratio = std::exp2 (smoothedSemis / 12.0f);
+        const float mix    = smoothedMix.getNextValue();
+        const float power  = smoothedPower.getNextValue();
+        const float modeW  = smoothedMode.getNextValue();     // 0 = Default, 1 = Complex
+        const float fSemis = smoothedFormant.getNextValue();
 
-        // Write the input into the delay line (and a mono copy used for matching)
-        float monoSum = 0.0f;
-        for (int ch = 0; ch < numCh; ++ch)
+        const float ratio  = std::exp2 (smoothedSemis / 12.0f);
+        const float fRatio = std::exp2 (fSemis / 12.0f);
+
+        const float inL = buffer.getSample (0, i);
+        const float inR = numCh > 1 ? buffer.getSample (1, i) : inL;
+
+        // Dry signal, delayed by the latency
+        dryBuf.setSample (0, dryPos, inL);
+        dryBuf.setSample (1, dryPos, inR);
+        const int rd = (dryPos - dryDelay) & dryMask;
+        const float dryL = dryBuf.getSample (0, rd);
+        const float dryR = dryBuf.getSample (1, rd);
+        dryPos = (dryPos + 1) & dryMask;
+
+        // Default engine
+        float gL = 0.0f, gR = 0.0f;
+        grain.process (inL, inR, ratio, gL, gR);
+
+        // Complex engine (both engines always run so a mode switch is seamless)
+        float cL = pv[0].process (inL, ratio, fRatio);
+        float cR = numCh > 1 ? pv[1].process (inR, ratio, fRatio) : cL;
+
+        if (padDelay > 0)
         {
-            const float x = buffer.getSample (ch, i);
-            delayBuf.setSample (ch, writePos, x);
-            monoSum += x;
+            padBuf[0][(size_t) padPos] = cL;
+            padBuf[1][(size_t) padPos] = cR;
+            const size_t rp = (size_t) ((padPos - padDelay) & padMask);
+            cL = padBuf[0][rp];
+            cR = padBuf[1][rp];
+            padPos = (padPos + 1) & padMask;
         }
-        monoBuf[(size_t) writePos] = monoSum / (float) juce::jmax (1, numCh);
 
-        // Crossfade weights of the two grains, normalised so they always add up to 1
-        float wA = windowAt (dA);
-        float wB = windowAt (dB);
-        const float norm = 1.0f / juce::jmax (0.25f, wA + wB);
-        wA *= norm;
-        wB *= norm;
+        const float wetL = (1.0f - modeW) * gL + modeW * cL;
+        const float wetR = (1.0f - modeW) * gR + modeW * cR;
 
-        // Near 0 semitones, fade to the (aligned) dry signal
-        const float wetAmount = juce::jmin (1.0f, std::abs (smoothedSemis) / 0.1f);
+        // Near 0 semitones (and 0 formant shift) fade to the aligned dry signal
+        const float waDefault = juce::jmin (1.0f, std::abs (smoothedSemis) / 0.1f);
+        const float waComplex = juce::jmin (1.0f, (std::abs (smoothedSemis) + std::abs (fSemis)) / 0.1f);
+        const float wetAmount = (1.0f - modeW) * waDefault + modeW * waComplex;
         const float wetMix = mix * wetAmount * power;
 
-        for (int ch = 0; ch < numCh; ++ch)
-        {
-            const float wet = wA * readHermite (ch, dA) + wB * readHermite (ch, dB);
-            const float dry = delayBuf.getSample (ch, (writePos - dryDelay) & mask);
-            buffer.setSample (ch, i, dry * (1.0f - wetMix) + wet * wetMix);
-        }
-
-        // Read position moves at 'ratio' speed relative to the write position
-        const float step = 1.0f - ratio;
-        dA += step;
-        dB += step;
-
-        if (dA < dMin)       dA = chooseReseat (dB, true);
-        else if (dA > dMax)  dA = chooseReseat (dB, false);
-
-        if (dB < dMin)       dB = chooseReseat (dA, true);
-        else if (dB > dMax)  dB = chooseReseat (dA, false);
-
-        writePos = (writePos + 1) & mask;
+        buffer.setSample (0, i, dryL * (1.0f - wetMix) + wetL * wetMix);
+        if (numCh > 1)
+            buffer.setSample (1, i, dryR * (1.0f - wetMix) + wetR * wetMix);
     }
 }
 

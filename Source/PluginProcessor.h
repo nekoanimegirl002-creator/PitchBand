@@ -1,6 +1,8 @@
 #pragma once
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <vector>
+#include "GrainShifter.h"
+#include "PhaseVocoder.h"
 
 class PitchBendProcessor : public juce::AudioProcessor
 {
@@ -16,7 +18,7 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override { return "Pitch Bend"; }
+    const juce::String getName() const override { return "Pitch Band"; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     double getTailLengthSeconds() const override { return 0.0; }
@@ -38,28 +40,19 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
-    float readHermite (int ch, float delay) const noexcept;
-    float chooseReseat (float dOther, bool toTop);
+    // Default mode engine (grains + correlation) and Complex mode engine (phase vocoder + formants)
+    GrainShifter grain;
+    PhaseVocoder pv[2];
 
-    // Delay-line pitch shifter state.
-    // Two "grains" (taps) read the delay line at a speed that depends on the pitch ratio.
-    // When a grain runs out of its window it jumps back, and the jump target is chosen
-    // by waveform correlation so that the two grains stay in phase (no pumping).
-    juce::AudioBuffer<float> delayBuf;
-    std::vector<float> monoBuf, refSeg;
-    int mask = 0;
-    int writePos = 0;
-    float Wf = 2400.0f;     // grain window length in samples
-    float dMin = 0.0f;      // smallest grain delay (needs room to look ahead)
-    float dMax = 0.0f;      // largest grain delay = dMin + Wf
-    int searchRange = 0;    // how far (samples) a grain may be moved to find a match
-    int corrLen = 0;        // length (samples) of the segment used for matching
-    int dryDelay = 0;       // dry path delay = reported latency
-    float dA = 0.0f, dB = 0.0f; // current delays of the two grains
+    // Dry signal delayed by the reported latency, and a small pad that aligns the Complex engine
+    juce::AudioBuffer<float> dryBuf;
+    int dryMask = 0, dryPos = 0, dryDelay = 0;
+    std::vector<float> padBuf[2];
+    int padMask = 0, padPos = 0, padDelay = 0;
+
     double sr = 44100.0;
-
     float smoothedSemis = 0.0f;
-    juce::SmoothedValue<float> smoothedMix, smoothedPower;
+    juce::SmoothedValue<float> smoothedMix, smoothedPower, smoothedMode, smoothedFormant;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PitchBendProcessor)
 };
